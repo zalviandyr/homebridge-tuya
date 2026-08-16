@@ -41,17 +41,33 @@ function configureRotationSpeedInteger(
   const multiple = Math.pow(10, property.scale);
 
   const onGetHandler = () => {
-    const status = accessory.getStatus(schema.code)!;
-    const value = status.value as number / multiple;
+    const status = accessory.getStatus(schema.code);
+
+    if (!status) {
+      accessory.log.debug(
+        `No status available for RotationSpeed (${schema.code}), returning minimum value`,
+      );
+
+      return rotationSpeedProperty.minValue!;
+    }
+
+    const value = Number(status.value) / multiple;
     let level = ((value - hapProperty.minValue!) / hapProperty.minStep!);
     if (hapProperty.minValue !== 0) {
       level += 1;
     }
     const hapValue = level * rotationSpeedProperty.minStep!;
-    return limit(hapValue, rotationSpeedProperty.minValue!, rotationSpeedProperty.maxValue!);
+
+    return limit(
+      hapValue,
+      rotationSpeedProperty.minValue!,
+      rotationSpeedProperty.maxValue!,
+    );
   };
 
   accessory.log.debug('Set props for RotationSpeed:', rotationSpeedProperty);
+
+  let lastSpeed: number | undefined;
   service.getCharacteristic(accessory.Characteristic.RotationSpeed)
     .onGet(onGetHandler)
     .onSet(async value => {
@@ -59,9 +75,20 @@ function configureRotationSpeedInteger(
       if (!Number.isFinite(percent) || percent <= 0) {
         return;
       }
-      const hapLevel = Math.floor(percent / rotationSpeedProperty.minStep!);
+      const hapLevel = Math.floor(
+        percent / rotationSpeedProperty.minStep!,
+      );
+
       const speed = hapLevel * hapProperty.minStep! * multiple;
-      await accessory.sendCommands([{ code: schema.code, value: speed }], true);
+      if (speed === lastSpeed) {
+        return;
+      }
+      lastSpeed = speed;
+
+      await accessory.sendCommands([{
+        code: schema.code,
+        value: speed,
+      }], true);
     })
     .updateValue(onGetHandler())
     .setProps(rotationSpeedProperty);
