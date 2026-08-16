@@ -18,6 +18,7 @@ export interface LocalDeviceContext {
   name?: string;
   port?: number;
   pingGap?: number;
+  stateQueryGap?: number;
   connectTimeout?: number;
 }
 
@@ -57,6 +58,7 @@ export default class LocalDevice extends EventEmitter {
   private tmpLocalKey?: Buffer;
   private tmpRemoteKey?: Buffer;
   private pinger?: ReturnType<typeof setTimeout>;
+  private stateQueryTimer?: ReturnType<typeof setTimeout>;
   private connTimeout?: ReturnType<typeof setTimeout>;
   private errorReconnect?: ReturnType<typeof setTimeout>;
   private connectionAttempts = 0;
@@ -68,6 +70,7 @@ export default class LocalDevice extends EventEmitter {
     this.log = new PrefixLogger(logger(), `${(context.name || context.id)}(Local)`, false);
     this.context.port = this.context.port ?? 6668;
     this.context.pingGap = this.context.pingGap ?? 9;
+    this.context.stateQueryGap = this.context.stateQueryGap ?? 3;
     this.context.connectTimeout = this.context.connectTimeout ?? 30;
     this.protocol = ProtocolFactory.createProtocol(context.version);
   }
@@ -233,6 +236,7 @@ export default class LocalDevice extends EventEmitter {
         this.emit('connect');
         this._schedulePing();
         this.queryState();
+        this._scheduleStateQuery();
       }
     });
 
@@ -300,6 +304,9 @@ export default class LocalDevice extends EventEmitter {
     if (this.pinger) {
       clearTimeout(this.pinger); this.pinger = undefined;
     }
+    if (this.stateQueryTimer) {
+      clearTimeout(this.stateQueryTimer); this.stateQueryTimer = undefined;
+    }
     if (this.connTimeout) {
       clearTimeout(this.connTimeout); this.connTimeout = undefined;
     }
@@ -330,6 +337,25 @@ export default class LocalDevice extends EventEmitter {
     }, primaryDelay);
 
     this.pinger.unref?.();
+  }
+
+  private _scheduleStateQuery(): void {
+    if (this.stateQueryTimer) {
+      clearTimeout(this.stateQueryTimer);
+      this.stateQueryTimer = undefined;
+    }
+
+    const delay = (this.context.stateQueryGap ?? 3) * 1000;
+
+    this.stateQueryTimer = setTimeout(() => {
+      if (this.connected) {
+        this.queryState();
+      }
+
+      this._scheduleStateQuery();
+    }, delay);
+
+    this.stateQueryTimer.unref?.();
   }
 
   // ── Private: frame parsing ────────────────────────────────────────────────
@@ -453,6 +479,7 @@ export default class LocalDevice extends EventEmitter {
     this._schedulePing();
     this.emit('connect');
     this.queryState();
+    this._scheduleStateQuery();
   }
 
   /** @internal Used by gateway to propagate child state updates. */
