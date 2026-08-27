@@ -51,6 +51,13 @@ export default class TuyaHybridDeviceManager extends TuyaDeviceManager {
       this.log.info('Enriching local config with cloud device details…');
       this.localConfig = await this.enrichLocalConfigFromCloud(cloudDevices, this.localConfig);
     }
+
+    // Register key-refresh callback so the local manager can auto-update
+    // stale local_keys after a device reconnects to WiFi and rotates its key.
+    this.localDeviceManager.setKeyRefreshCallback(async (deviceId: string) => {
+      return this._fetchLocalKeyFromCloud(deviceId);
+    });
+
     const localDevices = await this.localDeviceManager.pullDevices();
     const mergedDevices:TuyaDevice[] = [];
     for (const localDevice of localDevices) {
@@ -147,6 +154,28 @@ export default class TuyaHybridDeviceManager extends TuyaDeviceManager {
         return value;
       })
       .catch(() => this.cloudDeviceManager.retrieveDeviceRTSP(deviceID));
+  }
+
+  /**
+   * Fetch the current local_key for a device directly from Tuya Cloud.
+   * Used by the auto key-refresh mechanism when a local device's key has rotated
+   * (e.g. after it reconnects to WiFi via the Tuya app).
+   * Returns the key string on success, or null if unavailable.
+   */
+  private async _fetchLocalKeyFromCloud(deviceId: string): Promise<string | null> {
+    try {
+      const res = await this.api.get(`/v1.0/devices/${deviceId}`);
+      if (!res.success) {
+        this.log.warn(`[KeyRefresh] Cloud API error for device ${deviceId}: code=${res.code} msg=${res.msg}`);
+        return null;
+      }
+      const localKey = (res.result as Record<string, unknown>)?.local_key as string | undefined;
+      return localKey ?? null;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log.warn(`[KeyRefresh] Exception while fetching local_key for ${deviceId}: ${msg}`);
+      return null;
+    }
   }
 
   /**

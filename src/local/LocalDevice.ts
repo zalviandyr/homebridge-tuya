@@ -75,6 +75,19 @@ export default class LocalDevice extends EventEmitter {
     this.protocol = ProtocolFactory.createProtocol(context.version);
   }
 
+  /**
+   * Replace the local encryption key and reconnect immediately.
+   * Call this when the Tuya cloud reports a new local_key for the device
+   * (e.g. after a WiFi reset rotates the key).
+   */
+  updateKey(newKey: Buffer): void {
+    this.context.key = newKey;
+    this.log.info(`Local key updated for ${this.context.name ?? this.context.id} – reconnecting`);
+    this.disconnect();
+    this.connectionAttempts = 0;
+    this.connect();
+  }
+
   connect(): void {
     if (this.socket) {
       return;

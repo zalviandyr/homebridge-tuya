@@ -96,10 +96,37 @@ export default class LocalDeviceManager extends TuyaDeviceManager {
   private gatewayConnections: Map<string, LocalDevice> = new Map();
   // ──────────────────────────────────────────────────────────────────────────
 
+  // ── Auto key-refresh support ──────────────────────────────────────────────
+  /**
+   * Optional callback registered by TuyaHybridDeviceManager when cloud
+   * credentials are available. Called when a local device encounters
+   * consecutive connection errors that suggest a stale local_key.
+   * Returns the new local_key string fetched from Tuya Cloud, or null if
+   * the refresh failed or credentials are unavailable.
+   */
+  private keyRefreshCallback?: (deviceId: string) => Promise<string | null>;
+  /** Consecutive error count per deviceId – reset on successful connect. */
+  private connectionErrorCounts: Map<string, number> = new Map();
+  /** How many consecutive errors trigger a key-refresh attempt. */
+  private static readonly KEY_REFRESH_ERROR_THRESHOLD = 3;
+  /** Prevent multiple simultaneous refresh attempts for the same device. */
+  private keyRefreshInProgress: Set<string> = new Set();
+  // ──────────────────────────────────────────────────────────────────────────
+
   constructor(localConfig: LocalConfig, debugMode: boolean = false) {
     super(debugMode);
     this.config = localConfig;
     this.discovery = new TuyaDiscovery();
+  }
+
+  /**
+   * Register a callback that fetches the current local_key for a device from
+   * Tuya Cloud. Called automatically when a device accumulates enough
+   * consecutive connection errors to suggest the key has rotated.
+   * Only available when cloud credentials are present (mode: "both").
+   */
+  setKeyRefreshCallback(callback: (deviceId: string) => Promise<string | null>): void {
+    this.keyRefreshCallback = callback;
   }
 
   override async pullDevices(): Promise<TuyaDevice[]> {
@@ -622,6 +649,58 @@ export default class LocalDeviceManager extends TuyaDeviceManager {
   }
 
   /**
+   * Attempt to refresh the local_key for a device from Tuya Cloud.
+   * Triggered after KEY_REFRESH_ERROR_THRESHOLD consecutive connection errors.
+   * On success, updates the in-memory key and reconnects.
+   */
+  private async _tryRefreshLocalKey(deviceId: string, device: TuyaDevice, conn: LocalDevice): Promise<void> {
+    if (!this.keyRefreshCallback) {
+      return;
+    }
+
+    this.keyRefreshInProgress.add(deviceId);
+    this.log.info(
+      `[KeyRefresh] Device "${device.name}" (${deviceId}) has had ` +
+      `${LocalDeviceManager.KEY_REFRESH_ERROR_THRESHOLD} consecutive errors – ` +
+      'fetching latest local_key from Tuya Cloud…',
+    );
+
+    try {
+      const newKey = await this.keyRefreshCallback(deviceId);
+      if (!newKey) {
+        this.log.warn(`[KeyRefresh] Could not retrieve local_key for ${deviceId} from cloud`);
+        return;
+      }
+
+      const currentKey = (device as TuyaDevice & { localKey?: string }).localKey;
+      if (currentKey === newKey) {
+        this.log.debug(`[KeyRefresh] Cloud returned the same local_key for ${deviceId} – key has not rotated`);
+        return;
+      }
+
+      this.log.info(`[KeyRefresh] New local_key received for "${device.name}" (${deviceId}) – applying`);
+
+      // Update in-memory state
+      (device as TuyaDevice & { localKey?: string }).localKey = newKey;
+      this.connectionErrorCounts.delete(deviceId);
+
+      // Update the config entry so future connections use the new key
+      const cfg = this.config.devices?.find(d => d.tuyaDeviceId === deviceId);
+      if (cfg) {
+        cfg.tuyaKey = newKey;
+      }
+
+      // Reconnect with the new key
+      conn.updateKey(Buffer.from(newKey, 'utf8'));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log.warn(`[KeyRefresh] Error refreshing local_key for ${deviceId}: ${msg}`);
+    } finally {
+      this.keyRefreshInProgress.delete(deviceId);
+    }
+  }
+
+  /**
    * Set up auto-detection listener to count switches from device status updates.
    * Called BEFORE conn.connect() to avoid race conditions.
    * Uses time-based accumulation to capture all switches across multiple updates.
@@ -938,6 +1017,7 @@ export default class LocalDeviceManager extends TuyaDeviceManager {
     );
 
     conn.on('connect', () => {
+      this.connectionErrorCounts.delete(connectDeviceID);
       device.online = true;
       this.emit(TuyaDeviceManager.Events.DEVICE_INFO_UPDATE, device, { online: true });
       // ── Zigbee: when a gateway connects, set up its children ──
@@ -975,6 +1055,16 @@ export default class LocalDeviceManager extends TuyaDeviceManager {
 
     conn.on('error', (err: Error) => {
       this.log.warn(`Error for local device ${connectDeviceID}: ${err.message}`);
+
+      if (this.keyRefreshCallback) {
+        const errorCount = (this.connectionErrorCounts.get(connectDeviceID) ?? 0) + 1;
+        this.connectionErrorCounts.set(connectDeviceID, errorCount);
+
+        if (errorCount >= LocalDeviceManager.KEY_REFRESH_ERROR_THRESHOLD
+          && !this.keyRefreshInProgress.has(connectDeviceID)) {
+          this._tryRefreshLocalKey(connectDeviceID, device, conn);
+        }
+      }
     });
 
     // Set up auto-detection listener BEFORE connecting to avoid race conditions
